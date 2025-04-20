@@ -33,6 +33,7 @@ limitations under the License.
 #define MODE_TRAINING  1
 
 int current_mode = MODE_INFERENCE; // Default mode
+uint8_t target_class;
 
 #undef PROFILE_MICRO_SPEECH
 
@@ -57,7 +58,7 @@ int8_t* model_input_buffer = nullptr;
 
 constexpr int feature_points_byte_count = 4;
 constexpr int feature_struct_byte_count =
-    (sizeof(int8_t)) + feature_points_byte_count;
+    3*(sizeof(int8_t)) + feature_points_byte_count;
 
 #define BLE_SENSE_UUID(val) ("4798e0f2-" val "-4d68-af64-8a8f5258404e")
 BLEService service(BLE_SENSE_UUID("0000"));
@@ -73,7 +74,7 @@ uint8_t feature_struct_buffer[feature_struct_byte_count] = {};
 int8_t* feature_transmit_length =
     reinterpret_cast<int8_t*>(feature_struct_buffer);
 int8_t* feature_points =
-    reinterpret_cast<int8_t*>(feature_struct_buffer + (sizeof(int8_t)));
+    reinterpret_cast<int8_t*>(feature_struct_buffer + 3*(sizeof(int8_t)));
 
 bool training_in_progress = false;
 
@@ -125,16 +126,16 @@ int32_t getTargetClassFromUser() {
     // Compare input to "yes" or "no" and return the target class index
     if (input == "silence") {
         TF_LITE_REPORT_ERROR(error_reporter, "User input: silence (0)");
-        return 0; // "yes" corresponds to class index 1
+        return 0; // "silence" corresponds to class index 0
     } else if (input == "unknown") {
         TF_LITE_REPORT_ERROR(error_reporter, "User input: unknown (1)");
-        return 1; // "no" corresponds to class index 0
+        return 1; // "unknown" corresponds to class index 1
     } else if (input == "yes") {
         TF_LITE_REPORT_ERROR(error_reporter, "User input: yes (2)");
-        return 2; // "no" corresponds to class index 0
+        return 2; // "yes" corresponds to class index 2
     } else if (input == "no") {
         TF_LITE_REPORT_ERROR(error_reporter, "User input: no (3)");
-        return 3; // "no" corresponds to class index 0
+        return 3; // "no" corresponds to class index 3
     } else {
         TF_LITE_REPORT_ERROR(error_reporter, "Invalid input. Please enter 'yes' or 'no'.");
         return -1; // Invalid input
@@ -387,7 +388,7 @@ void trainingMode()
 
   training_in_progress = true;
 
-  int32_t target_class = getTargetClassFromUser();
+  target_class = getTargetClassFromUser();
   if (target_class == -1)
     return;
   
@@ -510,9 +511,22 @@ void loop() {
       training_in_progress = false;
       if (central && central.connected()) {
         Serial.println("sending feature buffer");
-        *feature_transmit_length = 4;
+        *feature_transmit_length = 6;
+        TF_LITE_REPORT_ERROR(error_reporter, "output tensor data : %d :: %d :: %d :: %d", output->data.uint8[0], output->data.uint8[1],output->data.uint8[2],output->data.uint8[3]);
         TF_LITE_REPORT_ERROR(error_reporter, "Sending : %d", feature_struct_buffer[0]);
-        TF_LITE_REPORT_ERROR(error_reporter, "Sending : %d :: %d :: %d :: %d", feature_struct_buffer[1], feature_struct_buffer[2],feature_struct_buffer[3],feature_struct_buffer[4]);
+        TF_LITE_REPORT_ERROR(error_reporter, "Sending : %d :: %d :: %d :: %d", feature_struct_buffer[3], feature_struct_buffer[4],feature_struct_buffer[5],feature_struct_buffer[6]);
+
+        feature_struct_buffer[1] = target_class; //actual index
+
+        if (found_command[0] == 'y') {
+          feature_struct_buffer[2] = 2; //predicted index
+        } else if (found_command[0] == 'n') {
+          feature_struct_buffer[2] = 3; //predicted index          
+        } else if (found_command[0] == 'u') {
+          feature_struct_buffer[2] = 1; //predicted index          
+        } else {
+          feature_struct_buffer[2] = 0; //predicted index          
+        }
         featureCharacteristic.writeValue(feature_struct_buffer,
                                         feature_struct_byte_count);
         //sendModelWeights();
