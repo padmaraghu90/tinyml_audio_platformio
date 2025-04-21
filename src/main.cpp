@@ -32,8 +32,12 @@ limitations under the License.
 #define MODE_INFERENCE 0
 #define MODE_TRAINING  1
 
+#define DIFFERENTIAL_PRIVACY 0
+#define HOMOMORPHIC_ENCRYPTION 1
+
 int current_mode = MODE_INFERENCE; // Default mode
-uint8_t target_class;
+bool recording_started = false; 
+int target_class;
 
 #undef PROFILE_MICRO_SPEECH
 
@@ -62,13 +66,15 @@ constexpr int feature_struct_byte_count =
 
 #define BLE_SENSE_UUID(val) ("4798e0f2-" val "-4d68-af64-8a8f5258404e")
 BLEService service(BLE_SENSE_UUID("0000"));
-//BLECharacteristic featureCharacteristic(BLE_SENSE_UUID("300a"), BLERead,                                       feature_struct_byte_count);
+
 BLECharacteristic featureCharacteristic(
   BLE_SENSE_UUID("300a"),
   BLERead | BLENotify | BLEWrite, // Adjust as needed
   feature_struct_byte_count
 );
-BLECharacteristic weightsChar(BLE_SENSE_UUID("300b"), BLERead | BLENotify | BLEWrite, 512);
+// This characteristic is for the XIAO to receive data (aggregated scores) from the central
+BLECharacteristic aggregationCharacteristic(BLE_SENSE_UUID("300b"),  BLERead | BLENotify | BLEWrite, // Adjust as needed
+4);
 
 uint8_t feature_struct_buffer[feature_struct_byte_count] = {};
 int8_t* feature_transmit_length =
@@ -77,6 +83,44 @@ int8_t* feature_points =
     reinterpret_cast<int8_t*>(feature_struct_buffer + 3*(sizeof(int8_t)));
 
 bool training_in_progress = false;
+
+
+#if DIFFERENTIAL_PRIVACY
+// DP Configuration
+#define DP_EPSILON 0.5     // Privacy budget (lower = more private)
+#define DP_SENSITIVITY 20  // Max possible score change per client
+
+void add_dp_noise(uint8_t *scores) {
+  for(int i=0; i<4; i++) {
+    // Generate Laplace noise
+    float u = (random() / (float)RAND_MAX) - 0.5f;
+    float scale = DP_SENSITIVITY / DP_EPSILON;
+    float noise = -scale * copysignf(1.0f, u) * logf(1.0f - 2.0f * fabsf(u));
+    
+    // Apply noise and clamp
+    int noisy_value = scores[i] + (int)noise;
+    scores[i] = (uint8_t)constrain(noisy_value, 0, 255);
+  }
+}
+#endif
+
+#if HOMOMORPHIC_ENCRYPTION
+// Simplified Additive HE
+#define HE_KEY 0xAB    // Shared secret
+
+void homomorphic_encrypt(uint8_t *scores) {
+  for(int i=0; i<4; i++) {
+    scores[i] = (scores[i] + HE_KEY) % 256;
+  }
+}
+
+void homomorphic_decrypt(const uint8_t *encrypted, uint8_t *decrypted) {
+  for(int i=0; i<4; i++) {
+    int temp = encrypted[i] - (HE_KEY);
+    decrypted[i] = (temp < 0) ? temp + 256 : temp % 256;
+  }
+}
+#endif
 
 void clearSerialBuffer() {
     while (Serial.available() > 0) {
@@ -143,79 +187,6 @@ int32_t getTargetClassFromUser() {
 } 
 
 
-#define NUM_CLASSES 4
-#define NUM_PARAMETERS 16652
-
-// Compute pseudo-updates
-float* computePseudoUpdates(TfLiteTensor* output, int32_t target_class) {
-  uint8_t* output_data = output->data.uint8;
-
-  // Dequantize the output
-  float output_scale = output->params.scale;
-  int output_zero_point = output->params.zero_point;
-  float dequantized_output[NUM_CLASSES]; // Replace with the actual number of classes
-  for (int i = 0; i < NUM_CLASSES; i++) {
-      dequantized_output[i] = (output_data[i] - output_zero_point) * output_scale;
-  }
-
-  // Compute pseudo-updates using the dequantized output
-
-    float* updates = new float[NUM_PARAMETERS];
-    for (int i = 0; i < NUM_PARAMETERS; i++) {
-        // Simplified update rule: nudge weights based on prediction error
-        updates[i] = dequantized_output[target_class] - output_data[i];
-    }
-    return updates;
-}
-
-#if 0
-void sendUpdatesOverBLE(float* updates, int num_updates) {
-    int num_chunks = (num_updates * sizeof(float)) / MTU_SIZE;
-    if ((num_updates * sizeof(float)) % MTU_SIZE != 0) {
-        num_chunks++;
-    }
-
-    for (int i = 0; i < num_chunks; i++) {
-        int chunk_size = MTU_SIZE;
-        if (i == num_chunks - 1) {
-            chunk_size = (num_updates * sizeof(float)) % MTU_SIZE;
-        }
-
-        // Send the chunk
-        pCharacteristic->setValue((uint8_t*)(updates + (i * MTU_SIZE / sizeof(float))), chunk_size);
-        pCharacteristic->notify();
-        delay(10); // Add a small delay to avoid overwhelming the BLE stack
-    }
-}
-#endif 
-
-void onWeightsReceived(BLEDevice central, BLECharacteristic characteristic) {
-  // 1. Receive corrected weights
-  const uint8_t* data = characteristic.value();
-  float dequant_weights[244];
-  
-  // 2. Dequantize (int8 -> float32)
-  for (int i=0; i<244; i++) {
-    dequant_weights[i] = data[i] / 127.0f;
-  }
-  
-  // 3. Get model weights - WORKING METHOD for Arduino-TFLite
-  // First get the input tensor
-  TfLiteTensor* model_input = interpreter->input(0);
-  
-  // Calculate weights offset (assuming weights come right after input)
-  float* model_weights = model_input->data.f + model_input->bytes / sizeof(float);
-  
-  // 4. Update weights
-  memcpy(model_weights, dequant_weights, sizeof(dequant_weights));
-  
-  Serial.println("✅ Model weights updated");
-  Serial.print("First weight value: ");
-  Serial.println(model_weights[0], 5); // Print with 5 decimals
-}
-
-
-
 void ble_setup() {
   String name;
 
@@ -245,8 +216,7 @@ void ble_setup() {
   BLE.setAdvertisedService(service);
 
   service.addCharacteristic(featureCharacteristic);
-  service.addCharacteristic(weightsChar);
-  weightsChar.setEventHandler(BLEWritten, onWeightsReceived);
+  service.addCharacteristic(aggregationCharacteristic);
 
   BLE.addService(service);
 
@@ -261,7 +231,56 @@ void ble_setup() {
     Serial.println("Disconnected");
   });
 
+// Assign the write event handler to the aggregation characteristic
+aggregationCharacteristic.setEventHandler(BLEWritten, [](BLEDevice central, BLECharacteristic characteristic) {
+  
+  // Handle the received data
+  Serial.print("Received aggregation data (");
+  Serial.print(characteristic.valueLength());
+  Serial.print(" bytes): ");
 
+  const uint8_t* data = characteristic.value(); // Get a pointer to the received data (bytes)
+  uint16_t len = characteristic.valueLength();   // Get the length of the received data
+
+  // Expecting exactly 4 bytes for the aggregated scores
+  if (len == 4) {
+    Serial.print("Scores: ");
+    for (int i = 0; i < len; i++) {
+      // Access each byte as an unsigned 8-bit integer
+      Serial.print(data[i]);
+      Serial.print(" ");
+      // TODO: Use the received aggregated scores (data[i]) to update your local model
+      // This is where you would apply the aggregated values to your model parameters.
+      // data[0] is score for class 0, data[1] for class 1, etc.
+    }
+    Serial.println();
+#if HOMOMORPHIC_ENCRYPTION
+  {
+    uint8_t decrypted_data[4];
+
+    homomorphic_decrypt(data, &decrypted_data[0]);
+    Serial.print("Decrypted aggregated scores: ");
+    for (int i = 0; i < len; i++) {
+      // Access each byte as an unsigned 8-bit integer
+      Serial.print(decrypted_data[i]);
+      Serial.print(" ");
+      // TODO: Use the received aggregated scores (data[i]) to update your local model
+      // This is where you would apply the aggregated values to your model parameters.
+      // data[0] is score for class 0, data[1] for class 1, etc.
+    }
+  }
+#endif
+  } else {
+    Serial.print("Unexpected data length: ");
+    for (int i = 0; i < len; i++) {
+      Serial.print(data[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+  // Optional: Provide feedback or perform actions based on the received data
+  recording_started = false;
+});
 }
 
 
@@ -375,13 +394,9 @@ void setup() {
   Serial.println("Setup done!");
 }
 
-bool recording_started = false;
 
 void trainingMode()
 {
-  int32_t current_time;
-  const int kMaxSlices = 49; // Example: Buffer can store 49 slices
-  int totalSlicesCaptured = 0; // Counter for slices captured
 
   if (training_in_progress == true)
     return;
@@ -400,29 +415,6 @@ void trainingMode()
 }
 
 
-// Simplified weight extraction (for a single dense layer)
-void sendModelWeights() {
-  // Get the input tensor (replace with your model's weight tensor)
-  TfLiteTensor* tensor = interpreter->input_tensor(0);
-  float* weights = tensor->data.f;
-  int weight_count = tensor->bytes / sizeof(float);
-
-  // Quantize to int8 (reduce size for BLE)
-  int8_t quantized_weights[weight_count];
-  for (int i = 0; i < weight_count; i++) {
-    quantized_weights[i] = static_cast<int8_t>(weights[i] * 127.0);
-  }
-
-  // Send via BLE
-  weightsChar.writeValue(quantized_weights, sizeof(quantized_weights));
-  Serial.println("Weights sent!");
-  TF_LITE_REPORT_ERROR(error_reporter, "weight count : %d",
-                        weight_count);
-}
-
-
-
-// The name of this function is important for Arduino compatibility.
 void loop() {
 #ifdef PROFILE_MICRO_SPEECH
   const uint32_t prof_start = millis();
@@ -507,15 +499,26 @@ void loop() {
   if ((current_mode == MODE_TRAINING) && is_new_command) {
       stopRecording();
       Serial.println("Audio captured and features computed.");
-      recording_started = false;
+
       training_in_progress = false;
       if (central && central.connected()) {
+
+#if DIFFERENTIAL_PRIVACY
+        TF_LITE_REPORT_ERROR(error_reporter, "Original scores : %d :: %d :: %d :: %d", feature_struct_buffer[3], feature_struct_buffer[4],feature_struct_buffer[5],feature_struct_buffer[6]);
+        add_dp_noise(&feature_struct_buffer[3]);
+        TF_LITE_REPORT_ERROR(error_reporter, "Scores with noise : %d :: %d :: %d :: %d", feature_struct_buffer[3], feature_struct_buffer[4],feature_struct_buffer[5],feature_struct_buffer[6]);
+#endif
+
+#if HOMOMORPHIC_ENCRYPTION
+        TF_LITE_REPORT_ERROR(error_reporter, "Original scores : %d :: %d :: %d :: %d", feature_struct_buffer[3], feature_struct_buffer[4],feature_struct_buffer[5],feature_struct_buffer[6]);
+        homomorphic_encrypt(&feature_struct_buffer[3]);
+        TF_LITE_REPORT_ERROR(error_reporter, "Encrypted scores : %d :: %d :: %d :: %d", feature_struct_buffer[3], feature_struct_buffer[4],feature_struct_buffer[5],feature_struct_buffer[6]);
+#endif
+
         Serial.println("sending feature buffer");
         *feature_transmit_length = 6;
-        TF_LITE_REPORT_ERROR(error_reporter, "output tensor data : %d :: %d :: %d :: %d", output->data.uint8[0], output->data.uint8[1],output->data.uint8[2],output->data.uint8[3]);
-        TF_LITE_REPORT_ERROR(error_reporter, "Sending : %d", feature_struct_buffer[0]);
-        TF_LITE_REPORT_ERROR(error_reporter, "Sending : %d :: %d :: %d :: %d", feature_struct_buffer[3], feature_struct_buffer[4],feature_struct_buffer[5],feature_struct_buffer[6]);
-
+        
+        
         feature_struct_buffer[1] = target_class; //actual index
 
         if (found_command[0] == 'y') {
@@ -529,7 +532,8 @@ void loop() {
         }
         featureCharacteristic.writeValue(feature_struct_buffer,
                                         feature_struct_byte_count);
-        //sendModelWeights();
+    } else {
+      recording_started = false;
     }
   }
 
